@@ -47,7 +47,7 @@ struct Args {
     #[arg(long, default_value_t = 60.0)]
     ct_ratio: f64,
 
-    #[arg(long, default_value_t = 400)]
+    #[arg(long, default_value_t = 860)]
     sps: u32,
 
     #[arg(long, default_value_t = 1)]

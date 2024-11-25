@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use linux_embedded_hal::I2cdev;
 use embedded_hal::blocking::i2c::{Write, WriteRead};
 use rppal::gpio::{Gpio, Trigger};
-use std::sync::mpsc;
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::time::Instant;
 use tokio::time::{self, Duration};
@@ -11,7 +10,7 @@ use tokio::time::{self, Duration};
 #[derive(Debug)]
 struct Reading {
     value: i16,
-    timestamp_nanos: u128,
+    _timestamp_nanos: u128,  // Might be useful
 }
 
 #[async_trait]
@@ -155,7 +154,7 @@ fn configure_ads1115(
 
 fn turn_off_ads1115(i2c: &mut I2cdev, address: u8, verbose: bool) {
     let config_word = 
-        ((false as u16) << 15) |           // OS: No effect
+        ((false as u16) << 15) |          // OS: No effect
         ((0u8 & 0x7) as u16) << 12 |      // MUX: default (AIN0/AIN1)
         ((2u8 & 0x7) as u16) << 9 |       // PGA: default (±2.048V)
         ((true as u16) << 8) |            // MODE: default (Single-shot)
@@ -225,6 +224,13 @@ impl ADS1115Collector {
         }
         self.tag_manager.update(&rms_tag, 0.0, 0).await;
         
+        // Add SPS tag
+        let sps_tag = format!("{}_sps", self.tag_prefix);
+        if self.verbose {
+            println!("Creating tag: {}", sps_tag);
+        }
+        self.tag_manager.update(&sps_tag, 0.0, 0).await;
+
         if self.fft {
             for i in 2..=7 {
                 let harmonic_tag = format!("{}_harmonic_{}", self.tag_prefix, i);
@@ -253,36 +259,99 @@ impl ADS1115Collector {
     }
 
     fn calculate_harmonics(&self, processed: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        // Find zero crossings and trim data (like in old_main.rs)
+        let mut start_idx = 0;
+        for i in 1..processed.len() {
+            if processed[i-1] < 0.0 && processed[i] >= 0.0 {
+                let dist_prev = processed[i-1].abs();
+                let dist_curr = processed[i].abs();
+                start_idx = if dist_prev < dist_curr { i-1 } else { i };
+                break;
+            }
+        }
+        
+        let mut end_idx = processed.len() - 1;
+        for i in (1..processed.len()).rev() {
+            if processed[i-1] < 0.0 && processed[i] >= 0.0 {
+                let dist_prev = processed[i-1].abs();
+                let dist_curr = processed[i].abs();
+                end_idx = if dist_prev < dist_curr { i-1 } else { i };
+                break;
+            }
+        }
+        
+        // Use trimmed slice for analysis
+        let trimmed_values = &processed[start_idx..=end_idx];
+        
+        // Apply Hamming window
+        let windowed: Vec<Complex<f64>> = trimmed_values.iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let window = 0.54 - 0.46 * (2.0 * std::f64::consts::PI * i as f64 / (trimmed_values.len() - 1) as f64).cos();
+                Complex::new(x * window, 0.0)
+            })
+            .collect();
+
         let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(processed.len());
+        let fft = planner.plan_fft_forward(windowed.len());
+        let mut spectrum = windowed;
+        fft.process(&mut spectrum);
 
-        // Prepare complex input
-        let mut complex_input: Vec<Complex<f64>> = processed.iter()
-            .map(|&x| Complex::new(x, 0.0))
+        // Calculate magnitude spectrum (normalize by sqrt of length like old_main.rs)
+        let magnitudes: Vec<f64> = spectrum.iter()
+            .take(spectrum.len() / 2)  // Only take first half (Nyquist)
+            .map(|c| (c.norm() / (processed.len() as f64).sqrt()))
             .collect();
 
-        // Perform FFT
-        fft.process(&mut complex_input);
+        // Find fundamental frequency (largest magnitude after DC)
+        let fundamental_idx = (1..magnitudes.len())
+            .max_by(|&i, &j| magnitudes[i].partial_cmp(&magnitudes[j]).unwrap())
+            .unwrap();
+        let fundamental_magnitude = magnitudes[fundamental_idx];
 
-        // Calculate magnitude spectrum
-        let magnitudes: Vec<f64> = complex_input.iter()
-            .map(|c| c.norm())
-            .collect();
+        // Calculate harmonic percentages
+        let harmonics: Vec<f64> = (2..=7).map(|i| {
+            let harmonic_idx = fundamental_idx * i;
+            if harmonic_idx < magnitudes.len() {
+                (magnitudes[harmonic_idx] / fundamental_magnitude) * 100.0
+            } else {
+                0.0
+            }
+        }).collect();
 
-        // Calculate phase spectrum
-        let phases: Vec<f64> = complex_input.iter()
+        // Calculate phases (if needed)
+        let phases: Vec<f64> = spectrum.iter()
             .map(|c| c.arg())
             .collect();
 
-        // Calculate harmonic percentages relative to fundamental
-        let fundamental = magnitudes[1];  // Index 1 is 50/60Hz component
-        let harmonics: Vec<f64> = magnitudes.iter()
-            .skip(2)
-            .take(6)  // Get harmonics 2-7
-            .map(|&m| (m / fundamental) * 100.0)
-            .collect();
-
         (harmonics, magnitudes, phases)
+    }
+
+    fn calculate_effective_sps(&self, readings: &[Reading]) -> f64 {
+        if readings.len() < 2 {
+            return 0.0;
+        }
+        
+        // Calculate time difference between first and last reading in seconds
+        let time_span_nanos = readings.last().unwrap()._timestamp_nanos - readings.first().unwrap()._timestamp_nanos;
+        let time_span_seconds = time_span_nanos as f64 / 1_000_000_000.0;
+        
+        // Calculate samples per second
+        (readings.len() as f64 - 1.0) / time_span_seconds
+    }
+}
+
+fn sps_to_dr(sps: u32) -> u8 {
+    match sps {
+        8 => 0,   // 000
+        16 => 1,  // 001 
+        32 => 2,  // 010
+        64 => 3,  // 011
+        128 => 4, // 100
+        250 => 5, // 101
+        475 => 6, // 110
+        860 => 7, // 111
+        _ => 7    // Default to fastest rate if invalid
     }
 }
 
@@ -320,7 +389,7 @@ impl Collector for ADS1115Collector {
                 Some(0),        // MUX: AIN0 vs AIN1 (differential)
                 Some(1),        // PGA: ±4.096V
                 Some(false),    // MODE: Continuous
-                Some(7),        // DR: 860 SPS
+                Some(sps_to_dr(self.sps)),        // DR: 860 SPS
                 None,           // COMP_MODE: default
                 None,           // COMP_POL: default
                 Some(true),     // COMP_LAT: Latching
@@ -331,18 +400,21 @@ impl Collector for ADS1115Collector {
                 continue;
             }
 
-            // Collect readings
+            // Collection loop with timeout
+            let collection_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
             while readings.len() < 120 {
                 tokio::select! {
+                    _ = tokio::time::sleep_until(collection_deadline) => {
+                        break;
+                    }
                     Some(_) = rx.recv() => {
                         let mut read_buf = [0u8; 2];
                         if i2c.write_read(self.i2c_address, &[0x00], &mut read_buf).is_ok() {
                             let raw_value = i16::from_be_bytes([read_buf[0], read_buf[1]]);
                             let timestamp_nanos = start_time.elapsed().as_nanos();
-                            readings.push(Reading { value: raw_value, timestamp_nanos });
+                            readings.push(Reading { value: raw_value, _timestamp_nanos: timestamp_nanos });
                         }
                     }
-                    else => break,
                 }
             }
 
@@ -354,6 +426,10 @@ impl Collector for ADS1115Collector {
                 let processed = self.process_readings(&readings);
                 let time_us = chrono::Utc::now().timestamp_micros();
                 
+                // Calculate and update effective SPS
+                let effective_sps = self.calculate_effective_sps(&readings);
+                self.tag_manager.update(&format!("{}_sps", self.tag_prefix), effective_sps, time_us).await;
+
                 // Calculate and update RMS
                 let rms = self.calculate_rms(&processed);
                 self.tag_manager.update(&format!("{}_rms", self.tag_prefix), rms, time_us).await;
@@ -361,9 +437,9 @@ impl Collector for ADS1115Collector {
                 // Calculate and update FFT if enabled
                 if self.fft {
                     let (harmonics, _, _) = self.calculate_harmonics(&processed);
-                    for (i, percentage) in harmonics.iter().enumerate().skip(1) {
+                    for (i, percentage) in harmonics.iter().enumerate() {
                         self.tag_manager.update(
-                            &format!("{}_harmonic_{}", self.tag_prefix, i + 1),
+                            &format!("{}_harmonic_{}", self.tag_prefix, i + 2),
                             *percentage,
                             time_us
                         ).await;

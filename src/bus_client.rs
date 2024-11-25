@@ -205,25 +205,23 @@ impl BusClient for PyMScadaBusClient {
         loop {
             if !self.connected {
                 if let Err(e) = self.connect().await {
-                    println!("Connection failed: {}", e);
+                    println!("Connection attempt failed: {}", e);
                     continue;
                 }
             }
 
             tokio::select! {
-                // Handle incoming messages from the bus
-                Some(result) = async { 
+                result = async { 
                     if let Some(stream) = &mut self.stream {
-                        Some(stream.read(&mut buffer).await)
+                        stream.read(&mut buffer).await
                     } else {
-                        None
+                        Ok(0)
                     }
                 } => {
                     match result {
                         Ok(0) => {
                             println!("Server closed the connection");
                             self.handle_connection_loss().await;
-                            continue;
                         }
                         Ok(n) => {
                             // Append new data to read_buffer
@@ -259,7 +257,6 @@ impl BusClient for PyMScadaBusClient {
                         Err(e) => {
                             println!("Error reading from socket: {}", e);
                             self.handle_connection_loss().await;
-                            continue;
                         }
                     }
                 }

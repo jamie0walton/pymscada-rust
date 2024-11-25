@@ -66,24 +66,27 @@ impl TagManager {
     pub async fn update(&self, name: &str, value: f64, time_us: i64) {
         let mut tags = self.tags.write().await;
         
-        if let Some(existing_tag) = tags.get(name) {
+        // Get existing tag's id and deadband or use defaults
+        let (id, deadband) = if let Some(existing_tag) = tags.get(name) {
             let diff = (existing_tag.value.value - value).abs();
             if diff <= existing_tag.deadband {
                 return;
             }
-        }
+            (existing_tag.id, existing_tag.deadband)
+        } else {
+            (0, self.default_deadband)
+        };
 
         tags.insert(
             name.to_string(),
             Tag {
-                id: 0,
+                id,  // Preserve existing ID
                 name: name.to_string(),
                 value: TagValue { value, time_us },
-                deadband: self.default_deadband,
+                deadband,
             },
         );
 
-        // Send update message through channel
         let _ = self.sender.send(TagMessage::Update {
             name: name.to_string(),
             value,
@@ -95,9 +98,15 @@ impl TagManager {
         let mut tags = self.tags.write().await;
         if let Some(tag) = tags.get_mut(name) {
             tag.id = id;
+            println!("TagManager::set_id got id {} for tag {}, sending current value", id, name);
+            let value = tag.value.value;
+            let time_us = tag.value.time_us;
+            self.sender.send(TagMessage::Update {
+                name: name.to_string(),
+                value,
+                time_us,
+            }).await.unwrap();
         }
-
-        self.sender.send(TagMessage::SetId { name: name.to_string(), id }).await.unwrap();
     }
 
     pub async fn reset_ids(&self) {
