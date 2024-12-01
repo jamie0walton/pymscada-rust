@@ -1,32 +1,31 @@
-use crate::tag::TagManager;
+/*
+Collector for ADS1115.
+
+This shall do all configuration of the ADS1115 and collection of data.
+*/
+
+use crate::rotary_buffer::{RotaryBuffer, Reading};
 use async_trait::async_trait;
 use linux_embedded_hal::I2cdev;
 use embedded_hal::blocking::i2c::{Write, WriteRead};
 use rppal::gpio::{Gpio, Trigger};
-use rustfft::{FftPlanner, num_complex::Complex};
-use std::time::Instant;
+use std::sync::Arc;
 use tokio::time::{self, Duration};
-
-#[derive(Debug)]
-struct Reading {
-    value: i16,
-    _timestamp_nanos: u128,  // Might be useful
-}
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[async_trait]
 pub trait Collector {
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn configure(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn collect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 pub struct ADS1115Collector {
-    tag_prefix: String,
-    tag_manager: TagManager,
+    buffer: Arc<RotaryBuffer>,
     i2c_bus: u8,
     i2c_address: u8,
-    ct_ratio: f64,
     sps: u32,
     verbose: bool,
-    fft: bool,
+    running: Arc<AtomicBool>,
 }
 
 fn configure_ads1115(
@@ -196,148 +195,106 @@ fn turn_off_ads1115(i2c: &mut I2cdev, address: u8, verbose: bool) {
 
 impl ADS1115Collector {
     pub fn new(
-        tag_prefix: String,
-        tag_manager: TagManager,
+        buffer: Arc<RotaryBuffer>,
         i2c_bus: u8,
         i2c_address: u8,
-        ct_ratio: f64,
         sps: u32,
         verbose: bool,
-        fft: bool,
     ) -> Self {
         ADS1115Collector {
-            tag_prefix,
-            tag_manager,
+            buffer,
             i2c_bus,
             i2c_address,
-            ct_ratio,
             sps,
             verbose,
-            fft,
+            running: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    async fn setup_tags(&self) {
-        let rms_tag = format!("{}_rms", self.tag_prefix);
-        if self.verbose {
-            println!("Creating tag: {}", rms_tag);
-        }
-        self.tag_manager.update(&rms_tag, 0.0, 0).await;
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.configure().await?;
+        let result = self.collect().await;
         
-        // Add SPS tag
-        let sps_tag = format!("{}_sps", self.tag_prefix);
-        if self.verbose {
-            println!("Creating tag: {}", sps_tag);
+        // Cleanup when stopping
+        let i2c_path = format!("/dev/i2c-{}", self.i2c_bus);
+        if let Ok(mut i2c) = I2cdev::new(&i2c_path) {
+            turn_off_ads1115(&mut i2c, self.i2c_address, self.verbose);
         }
-        self.tag_manager.update(&sps_tag, 0.0, 0).await;
+        
+        result
+    }
+}
 
-        if self.fft {
-            for i in 2..=7 {
-                let harmonic_tag = format!("{}_harmonic_{}", self.tag_prefix, i);
-                if self.verbose {
-                    println!("Creating tag: {}", harmonic_tag);
+#[async_trait]
+impl Collector for ADS1115Collector {
+    async fn configure(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let i2c_path = format!("/dev/i2c-{}", self.i2c_bus);
+        let mut i2c = I2cdev::new(&i2c_path)?;
+        
+        if !configure_ads1115(
+            &mut i2c,
+            self.i2c_address,
+            Some(true),     // OS: Start conversion
+            Some(0),        // MUX: AIN0 vs AIN1 (differential)
+            Some(1),        // PGA: ±4.096V
+            Some(false),    // MODE: Continuous
+            Some(sps_to_dr(self.sps)),  // DR: based on sps
+            None,           // COMP_MODE: default
+            None,           // COMP_POL: default
+            Some(true),     // COMP_LAT: Latching
+            Some(0),        // COMP_QUE: Assert after 1 conversion
+            self.verbose,
+        ) {
+            return Err("Failed to configure ADS1115".into());
+        }
+
+        self.running.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn collect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let i2c_path = format!("/dev/i2c-{}", self.i2c_bus);
+        let mut i2c = I2cdev::new(&i2c_path)?;
+        
+        // Setup GPIO and channel for interrupts
+        let gpio = Gpio::new()?;
+        let mut gclk_pin = gpio.get(4)?.into_input_pulldown();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let tx_interrupt = tx.clone();
+        
+        gclk_pin.set_async_interrupt(Trigger::FallingEdge, move |_level| {
+            let _ = tx_interrupt.blocking_send(());
+        })?;
+
+        let start_time = std::time::Instant::now();
+        
+        while self.running.load(Ordering::SeqCst) {
+            tokio::select! {
+                Some(_) = rx.recv() => {
+                    let mut read_buf = [0u8; 2];
+                    if i2c.write_read(self.i2c_address, &[0x00], &mut read_buf).is_ok() {
+                        let raw_value = i16::from_be_bytes([read_buf[0], read_buf[1]]);
+                        let timestamp_nanos = start_time.elapsed().as_nanos();
+                        
+                        let reading = Reading {
+                            value: raw_value,
+                            timestamp_nanos,
+                        };
+
+                        while !self.buffer.write(reading.clone()) {
+                            time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }
                 }
-                self.tag_manager.update(&harmonic_tag, 0.0, 0).await;
-            }
-        }
-    }
-
-    fn process_readings(&self, readings: &[Reading]) -> Vec<f64> {
-        // Convert raw ADC values to current values using CT ratio
-        readings.iter()
-            .map(|r| (r.value as f64) * 4.096 / 32768.0 * self.ct_ratio)
-            .collect()
-    }
-
-    fn calculate_rms(&self, processed: &[f64]) -> f64 {
-        // Calculate RMS value
-        let sum_squares: f64 = processed.iter()
-            .map(|x| x * x)
-            .sum();
-        let rms = (sum_squares / processed.len() as f64).sqrt();
-        rms
-    }
-
-    fn calculate_harmonics(&self, processed: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-        // Find zero crossings and trim data (like in old_main.rs)
-        let mut start_idx = 0;
-        for i in 1..processed.len() {
-            if processed[i-1] < 0.0 && processed[i] >= 0.0 {
-                let dist_prev = processed[i-1].abs();
-                let dist_curr = processed[i].abs();
-                start_idx = if dist_prev < dist_curr { i-1 } else { i };
-                break;
+                else => {
+                    // Channel closed or other error
+                    break;
+                }
             }
         }
         
-        let mut end_idx = processed.len() - 1;
-        for i in (1..processed.len()).rev() {
-            if processed[i-1] < 0.0 && processed[i] >= 0.0 {
-                let dist_prev = processed[i-1].abs();
-                let dist_curr = processed[i].abs();
-                end_idx = if dist_prev < dist_curr { i-1 } else { i };
-                break;
-            }
-        }
-        
-        // Use trimmed slice for analysis
-        let trimmed_values = &processed[start_idx..=end_idx];
-        
-        // Apply Hamming window
-        let windowed: Vec<Complex<f64>> = trimmed_values.iter()
-            .enumerate()
-            .map(|(i, &x)| {
-                let window = 0.54 - 0.46 * (2.0 * std::f64::consts::PI * i as f64 / (trimmed_values.len() - 1) as f64).cos();
-                Complex::new(x * window, 0.0)
-            })
-            .collect();
-
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(windowed.len());
-        let mut spectrum = windowed;
-        fft.process(&mut spectrum);
-
-        // Calculate magnitude spectrum (normalize by sqrt of length like old_main.rs)
-        let magnitudes: Vec<f64> = spectrum.iter()
-            .take(spectrum.len() / 2)  // Only take first half (Nyquist)
-            .map(|c| (c.norm() / (processed.len() as f64).sqrt()))
-            .collect();
-
-        // Find fundamental frequency (largest magnitude after DC)
-        let fundamental_idx = (1..magnitudes.len())
-            .max_by(|&i, &j| magnitudes[i].partial_cmp(&magnitudes[j]).unwrap())
-            .unwrap();
-        let fundamental_magnitude = magnitudes[fundamental_idx];
-
-        // Calculate harmonic percentages
-        let harmonics: Vec<f64> = (2..=7).map(|i| {
-            let harmonic_idx = fundamental_idx * i;
-            if harmonic_idx < magnitudes.len() {
-                (magnitudes[harmonic_idx] / fundamental_magnitude) * 100.0
-            } else {
-                0.0
-            }
-        }).collect();
-
-        // Calculate phases (if needed)
-        let phases: Vec<f64> = spectrum.iter()
-            .map(|c| c.arg())
-            .collect();
-
-        (harmonics, magnitudes, phases)
-    }
-
-    fn calculate_effective_sps(&self, readings: &[Reading]) -> f64 {
-        if readings.len() < 2 {
-            return 0.0;
-        }
-        
-        // Calculate time difference between first and last reading in seconds
-        let time_span_nanos = readings.last().unwrap()._timestamp_nanos - readings.first().unwrap()._timestamp_nanos;
-        let time_span_seconds = time_span_nanos as f64 / 1_000_000_000.0;
-        
-        // Calculate samples per second
-        (readings.len() as f64 - 1.0) / time_span_seconds
+        self.running.store(false, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -355,97 +312,78 @@ fn sps_to_dr(sps: u32) -> u8 {
     }
 }
 
-#[async_trait]
-impl Collector for ADS1115Collector {
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.setup_tags().await;
-        
-        // Setup I2C
-        let i2c_path = format!("/dev/i2c-{}", self.i2c_bus);
-        let mut i2c = I2cdev::new(&i2c_path)?;
-        
-        // Setup GPIO and channel for interrupts
-        let gpio = Gpio::new()?;
-        let mut gclk_pin = gpio.get(4)?.into_input_pulldown();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let tx_interrupt = tx.clone();
-        
-        gclk_pin.set_async_interrupt(Trigger::FallingEdge, move |_level| {
-            let _ = tx_interrupt.blocking_send(());
-        })?;
+// -------------------------------------------------
+// Tests
+// -------------------------------------------------
 
-        let mut interval = time::interval(Duration::from_millis(1000));
-        
-        loop {
-            interval.tick().await;
-            let mut readings = Vec::with_capacity(120);
-            let start_time = Instant::now();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
 
-            // Configure ADS1115
-            if !configure_ads1115(
-                &mut i2c,
-                self.i2c_address,
-                Some(true),     // OS: Start conversion
-                Some(0),        // MUX: AIN0 vs AIN1 (differential)
-                Some(1),        // PGA: ±4.096V
-                Some(false),    // MODE: Continuous
-                Some(sps_to_dr(self.sps)),        // DR: 860 SPS
-                None,           // COMP_MODE: default
-                None,           // COMP_POL: default
-                Some(true),     // COMP_LAT: Latching
-                Some(0),        // COMP_QUE: Assert after 1 conversion
-                self.verbose,
-            ) {
-                eprintln!("Failed to configure ADS1115");
-                continue;
+    const DEFAULT_BUS: u8 = 1;
+    const DEFAULT_ADDRESS: u8 = 0x48;
+    const DEFAULT_SPS: u32 = 860;
+    const TEST_SAMPLE_COUNT: usize = 2000;
+
+    #[tokio::test]
+    async fn test_collect_samples() {
+        let buffer = Arc::new(RotaryBuffer::new(TEST_SAMPLE_COUNT));
+        let collector = ADS1115Collector::new(
+            buffer.clone(),
+            DEFAULT_BUS,
+            DEFAULT_ADDRESS,
+            DEFAULT_SPS,
+            true, // verbose for debugging
+        );
+
+        // Clone the running flag before moving collector
+        let running = collector.running.clone();
+
+        // Spawn collector task
+        let collect_handle = tokio::spawn(async move {
+            collector.run().await
+        });
+
+        // Wait for samples to be collected
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(30); // 30 second timeout
+        let mut total_samples = 0;
+        const BATCH_SIZE: usize = 100;
+
+        while total_samples < TEST_SAMPLE_COUNT {
+            if start.elapsed() > timeout {
+                panic!("Timeout waiting for samples. Only collected {} samples", total_samples);
             }
 
-            // Collection loop with timeout
-            let collection_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-            while readings.len() < 120 {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(collection_deadline) => {
-                        break;
-                    }
-                    Some(_) = rx.recv() => {
-                        let mut read_buf = [0u8; 2];
-                        if i2c.write_read(self.i2c_address, &[0x00], &mut read_buf).is_ok() {
-                            let raw_value = i16::from_be_bytes([read_buf[0], read_buf[1]]);
-                            let timestamp_nanos = start_time.elapsed().as_nanos();
-                            readings.push(Reading { value: raw_value, _timestamp_nanos: timestamp_nanos });
-                        }
-                    }
-                }
-            }
-
-            // Turn off ADS1115 after collection
-            turn_off_ads1115(&mut i2c, self.i2c_address, self.verbose);
-
-            // Process readings and update tags
-            if !readings.is_empty() {
-                let processed = self.process_readings(&readings);
-                let time_us = chrono::Utc::now().timestamp_micros();
-                
-                // Calculate and update effective SPS
-                let effective_sps = self.calculate_effective_sps(&readings);
-                self.tag_manager.update(&format!("{}_sps", self.tag_prefix), effective_sps, time_us).await;
-
-                // Calculate and update RMS
-                let rms = self.calculate_rms(&processed);
-                self.tag_manager.update(&format!("{}_rms", self.tag_prefix), rms, time_us).await;
-
-                // Calculate and update FFT if enabled
-                if self.fft {
-                    let (harmonics, _, _) = self.calculate_harmonics(&processed);
-                    for (i, percentage) in harmonics.iter().enumerate() {
-                        self.tag_manager.update(
-                            &format!("{}_harmonic_{}", self.tag_prefix, i + 2),
-                            *percentage,
-                            time_us
-                        ).await;
-                    }
-                }
-            }
+            let readings = buffer.read_batch(BATCH_SIZE).await;
+            let batch_avg = readings.iter()
+                .map(|r| r.value as f64)
+                .sum::<f64>() / readings.len() as f64;
+            
+            println!("Batch {}: Average = {:.2}", 
+                total_samples / BATCH_SIZE, 
+                batch_avg
+            );
+            
+            total_samples += readings.len();
         }
+
+        // Calculate and print achieved SPS
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        let achieved_sps = total_samples as f64 / elapsed_secs;
+        println!("\nCollection Statistics:");
+        println!("  Total Samples: {}", total_samples);
+        println!("  Elapsed Time: {:.2} seconds", elapsed_secs);
+        println!("  Achieved SPS: {:.1} samples/second", achieved_sps);
+        println!("  Target SPS: {}", DEFAULT_SPS);
+
+        // Verify we got enough samples
+        assert!(total_samples >= TEST_SAMPLE_COUNT, 
+            "Expected {} samples, but got {}", TEST_SAMPLE_COUNT, total_samples);
+
+        // Use the cloned running flag to stop the collector
+        running.store(false, Ordering::SeqCst);
+        let _ = collect_handle.await;
     }
 } 
