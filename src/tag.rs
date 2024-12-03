@@ -118,8 +118,12 @@ impl TagManager {
         self.sender.send(TagMessage::ResetIds).await.unwrap();
     }
 
-    pub async fn get_tag(&self, name: &str) -> Option<Tag> {
+    pub async fn get_tag(&self, tag_name: &str) -> Option<Tag> {
         let tags = self.tags.read().await;
-        tags.get(name).cloned()
+        tags.get(tag_name).cloned()
     }
 } 
+
+// -------------------------------------------------
+// Tests
+// -------------------------------------------------

@@ -25,12 +25,17 @@ mod bus_client;
 // mod collector;
 mod tag;
 mod collector_ads1115;
+mod processor;
+mod rotary_buffer;
 
 use bus_client::{BusClient, PyMScadaBusClient};
 // use collector::{Collector, DataCollector};
-use collector_ads1115::{Collector, ADS1115Collector};
+use collector_ads1115::{ADS1115Collector};
 use tag::TagManager;
 use clap::Parser;
+use std::sync::Arc;
+use processor::Processor;
+use rotary_buffer::RotaryBuffer;
 
 #[derive(Parser, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -70,6 +75,10 @@ struct Args {
 
     #[arg(long)]
     fft: bool,
+
+    // On my raspberry pi 4, 737 readings takes 1 sec
+    #[arg(long, default_value_t = 737)]
+    batch_size: usize,
 }
 
 #[derive(Clone)]
@@ -93,18 +102,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tag_manager, receiver) = TagManager::new(args.deadband);
     let app = App::new(tag_manager.clone(), args.clone());
     
-    // Choose the collector
-    // let collector = DataCollector::new(app.tag_manager.clone());
+    let buffer = Arc::new(RotaryBuffer::new(10000));
+    
     let collector = ADS1115Collector::new(
-        app.args.tag_prefix.clone(),
-        app.tag_manager.clone(),
+        buffer.clone(),
         app.args.i2c_bus,
         u8::from_str_radix(&app.args.i2c_address.trim_start_matches("0x"), 16)?,
-        app.args.ct_ratio,
         app.args.sps,
+        app.args.verbose,
+    );
+
+    let processor = Processor::new(
+        app.args.tag_prefix.clone(),
+        app.tag_manager.clone(),
+        buffer.clone(),
+        app.args.batch_size,
+        app.args.ct_ratio,
         app.args.verbose,
         app.args.fft,
     );
+    
     let mut bus_client = PyMScadaBusClient::new(
         app.tag_manager.clone(),
         &app.args.bus_ip,
@@ -116,6 +133,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::spawn(async move {
         collector.run().await
     });
+
+    tokio::spawn(async move {
+        processor.run().await
+    });
+
     bus_client.run().await?;
     Ok(())
-} 
+}
+
+// -------------------------------------------------
+// Tests
+// -------------------------------------------------
