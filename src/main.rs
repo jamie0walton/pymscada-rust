@@ -76,7 +76,8 @@ struct Args {
     #[arg(long)]
     fft: bool,
 
-    #[arg(long, default_value_t = 120)]
+    // On my raspberry pi 4, 737 readings takes 1 sec
+    #[arg(long, default_value_t = 737)]
     batch_size: usize,
 }
 

@@ -5,7 +5,6 @@ use std::sync::RwLock;
 #[derive(Debug, Clone)]
 pub struct Reading {
     pub value: i16,
-    pub timestamp_nanos: u128,
 }
 
 pub struct RotaryBuffer {
@@ -19,9 +18,9 @@ pub struct RotaryBuffer {
 impl RotaryBuffer {
     pub fn new(capacity: usize) -> Self {
         RotaryBuffer {
-            buffer: RwLock::new(vec![Reading { value: 0, timestamp_nanos: 0 }; capacity]),
+            buffer: RwLock::new(vec![Reading { value: 0 }; capacity]),
             write_ptr: AtomicUsize::new(0),
-            read_ptr: AtomicUsize::new(0),
+            read_ptr: AtomicUsize::new(capacity - 1),
             capacity,
             notify: Notify::new(),
         }
@@ -72,7 +71,6 @@ impl RotaryBuffer {
                 }
             }
 
-            // Wait for more data
             self.notify.notified().await;
         }
     }
@@ -136,7 +134,6 @@ mod tests {
 
                 let reading = Reading {
                     value: i as i16,
-                    timestamp_nanos: i as u128,
                 };
                 
                 while !buffer_collector.write(reading.clone()) {

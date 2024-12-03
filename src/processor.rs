@@ -1,9 +1,9 @@
 use crate::tag::TagManager;
 use crate::rotary_buffer::{RotaryBuffer, Reading};
 use std::sync::Arc;
-use tokio::time::{self, Duration};
 use num_complex::Complex;
 use rustfft::FftPlanner;
+use chrono::Timelike;
 
 pub struct Processor {
     tag_prefix: String,
@@ -13,6 +13,7 @@ pub struct Processor {
     ct_ratio: f64,
     verbose: bool,
     fft: bool,
+    amp_hours: f64,
 }
 
 impl Processor {
@@ -33,10 +34,11 @@ impl Processor {
             ct_ratio,
             verbose,
             fft,
+            amp_hours: 0.0,
         }
     }
 
-    fn process_readings(&self, readings: &[Reading]) -> Vec<f64> {
+    fn scale_readings(&self, readings: &[Reading]) -> Vec<f64> {
         // Convert raw ADC values to current values using CT ratio
         readings.iter()
             .map(|r| (r.value as f64) * 4.096 / 32768.0 * self.ct_ratio)
@@ -113,80 +115,118 @@ impl Processor {
         }).collect()
     }
 
-    fn calculate_effective_sps(&self, readings: &[Reading]) -> f64 {
-        if readings.len() < 2 {
-            return 0.0;
-        }
-        
-        // Calculate time difference between first and last reading in seconds
-        let time_span_nanos = readings.last().unwrap().timestamp_nanos - readings.first().unwrap().timestamp_nanos;
-        let time_span_seconds = time_span_nanos as f64 / 1_000_000_000.0;
-        
-        // Calculate samples per second
-        (readings.len() as f64 - 1.0) / time_span_seconds
-    }
-
     async fn setup_tags(&self) {
         // Create RMS tag
-        let rms_tag = format!("{}_rms", self.tag_prefix);
+        let rms_tag_name = format!("{}_rms", self.tag_prefix);
         if self.verbose {
-            println!("Creating tag: {}", rms_tag);
+            println!("Creating tag: {}", rms_tag_name);
         }
-        self.tag_manager.update(&rms_tag, 0.0, 0).await;
+        self.tag_manager.get_tag(&rms_tag_name).await;
         
         // Create SPS tag
-        let sps_tag = format!("{}_sps", self.tag_prefix);
+        let sps_tag_name = format!("{}_sps", self.tag_prefix);
         if self.verbose {
-            println!("Creating tag: {}", sps_tag);
+            println!("Creating tag: {}", sps_tag_name);
         }
-        self.tag_manager.update(&sps_tag, 0.0, 0).await;
+        self.tag_manager.get_tag(&sps_tag_name).await;
 
         // Create harmonic tags if FFT is enabled
         if self.fft {
             for i in 2..=7 {
-                let harmonic_tag = format!("{}_harmonic_{}", self.tag_prefix, i);
+                let harmonic_tag_name = format!("{}_harmonic_{}", self.tag_prefix, i);
                 if self.verbose {
-                    println!("Creating tag: {}", harmonic_tag);
+                    println!("Creating tag: {}", harmonic_tag_name);
                 }
-                self.tag_manager.update(&harmonic_tag, 0.0, 0).await;
+                self.tag_manager.get_tag(&harmonic_tag_name).await;
             }
         }
+
+        // Create amp-hour tag
+        let ah_tag_name = format!("{}_Ah", self.tag_prefix);
+        if self.verbose {
+            println!("Creating tag: {}", ah_tag_name);
+        }
+        self.tag_manager.get_tag(&ah_tag_name).await;
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.setup_tags().await;
         
-        let mut interval = time::interval(Duration::from_millis(500));
-        
+        let mut amp_hours = self.amp_hours;
+        let mut compensation = 0.0;
+        let mut last_hour = 0;
+        let mut last_time_us = chrono::Utc::now().timestamp_micros();
+        let mut seen_new_day = false;
+
         loop {
-            interval.tick().await;
+            // buffer.read_batch() will block, do not add a wait.
             let readings = self.buffer.read_batch(self.batch_size).await;
-            if !readings.is_empty() {
-                let processed = self.process_readings(&readings);
-                let time_us = chrono::Utc::now().timestamp_micros();
-                let effective_sps = self.calculate_effective_sps(&readings);
+
+            // Work out the time first, then calculate samples per second
+            let time_us = chrono::Utc::now().timestamp_micros();
+            let sps = readings.len() as f64 * 1_000_000.0 /
+                (time_us - last_time_us) as f64;
+            self.tag_manager.update(
+                &format!("{}_sps", self.tag_prefix),
+                sps,
+                time_us
+            ).await;
+            if self.verbose {
+                println!("Readings: {}", readings.len());
+                println!("Samples per second: {}", sps);
+            }
+            
+            // Scale the readings
+            let scaled = self.scale_readings(&readings);
+
+            // Work out the RMS from the readings
+            let rms = self.calculate_rms(&scaled);
+            self.tag_manager.update(
+                &format!("{}_rms", self.tag_prefix),
+                rms,
+                time_us
+            ).await;
+            if self.verbose {
+                println!("rms: {}", rms);
+            }
+
+            // Sum amp-hours from midnight
+            let current_hour = chrono::Local::now().hour();
+            if current_hour < last_hour {
+                println!("Midnight crossed! Resetting amp-hours from {} to 0.0", amp_hours);
+                seen_new_day = true;
+                amp_hours = 0.0;
                 self.tag_manager.update(
-                    &format!("{}_sps", self.tag_prefix),
-                    effective_sps,
+                    &format!("{}_Ah", self.tag_prefix),
+                    0.0,
                     time_us
                 ).await;
-                let rms = self.calculate_rms(&processed);
+            }
+            last_hour = current_hour;
+            if seen_new_day {
+                let increment = rms * (time_us - last_time_us) as f64 / 3600.0 / 1_000_000.0;
+                let y = increment - compensation;
+                let t = amp_hours + y;
+                compensation = (t - amp_hours) - y;
+                amp_hours = t;
                 self.tag_manager.update(
-                    &format!("{}_rms", self.tag_prefix),
-                    rms,
+                    &format!("{}_Ah", self.tag_prefix),
+                    amp_hours,
                     time_us
                 ).await;
-                if self.fft {
-                    let harmonics = self.calculate_harmonics(&processed);
-                    for (i, percentage) in harmonics.iter().enumerate() {
-                        self.tag_manager.update(
-                            &format!("{}_harmonic_{}", self.tag_prefix, i + 2),
-                            *percentage,
-                            time_us
-                        ).await;
-                    }
+            }
+
+            if self.fft {
+                let harmonics = self.calculate_harmonics(&scaled);
+                for (i, percentage) in harmonics.iter().enumerate() {
+                    self.tag_manager.update(
+                        &format!("{}_harmonic_{}", self.tag_prefix, i + 2),
+                        *percentage,
+                        time_us
+                    ).await;
                 }
             }
+            last_time_us = time_us;
         }
     }
 }
@@ -259,14 +299,13 @@ mod tests {
                         .sum();
                     Reading {
                         value: (value * 32768.0 / 4.096) as i16,
-                        timestamp_nanos: (i as u128) * 100_000
                     }
                 })
                 .collect();
 
             // Process signal
-            let processed = processor.process_readings(&signal);
-            let rms = processor.calculate_rms(&processed);
+            let scaled = processor.scale_readings(&signal);
+            let rms = processor.calculate_rms(&scaled);
             let found_harmonics = processor.calculate_harmonics(&processed);
 
             // Print results

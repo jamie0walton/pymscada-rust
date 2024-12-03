@@ -171,7 +171,7 @@ impl PyMScadaBusClient {
                                 println!("Requesting ID for tag {}", name);
                             }
                             let packet = encode_id_request(&name);
-                            print_protocol(self.verbose, "Sending", &packet);
+                            // print_protocol(self.verbose, "Sending", &packet);
                             stream.write_all(&packet).await?;
                         } else {
                             if self.verbose {
@@ -179,7 +179,7 @@ impl PyMScadaBusClient {
                                     name, tag.id, value, time_us);
                             }
                             let packet = encode_set_float(tag.id, value, time_us);
-                            print_protocol(self.verbose, "Sending", &packet);
+                            // print_protocol(self.verbose, "Sending", &packet);
                             stream.write_all(&packet).await?;
                         }
                     }
@@ -238,7 +238,7 @@ impl BusClient for PyMScadaBusClient {
                                 let total_size = 14 + size;  // Update header size
                                 if read_buffer.len() >= total_size {
                                     let packet = read_buffer.drain(..total_size).collect::<Vec<_>>();
-                                    print_protocol(self.verbose, "Received", &packet);
+                                    // print_protocol(self.verbose, "Received", &packet);
                                     if let Ok((command, _tag_id, _, _data)) = protocol_decode(&packet) {
                                         if command == CMD_ID as u8 {  // Update command type
                                             if let Ok((id, tag_name)) = decode_id_response(&packet) {
@@ -387,6 +387,7 @@ pub fn decode_id_response(buffer: &[u8]) -> Result<(u32, String), &'static str> 
 } 
 
 // Change print_protocol to be a standalone function instead of a method
+/*
 fn print_protocol(verbose: bool, direction: &str, buffer: &[u8]) {
     if !verbose {
         return;
@@ -458,3 +459,4 @@ fn print_protocol(verbose: bool, direction: &str, buffer: &[u8]) {
     }
     println!("  Raw: {:?}", buffer);
 } 
+*/

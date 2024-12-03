@@ -7,7 +7,7 @@ This shall do all configuration of the ADS1115 and collection of data.
 use crate::rotary_buffer::{RotaryBuffer, Reading};
 use async_trait::async_trait;
 use linux_embedded_hal::I2cdev;
-use embedded_hal::blocking::i2c::{Write, WriteRead};
+use embedded_hal::blocking::i2c::{Write, WriteRead, Read};
 use rppal::gpio::{Gpio, Trigger};
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -266,19 +266,21 @@ impl Collector for ADS1115Collector {
             let _ = tx_interrupt.blocking_send(());
         })?;
 
-        let start_time = std::time::Instant::now();
-        
+        // Configure the device once before starting the read loop
+        if let Err(e) = i2c.write(self.i2c_address, &[0x00]) {
+            println!("Failed to configure ADS1115: {}", e);
+            return Ok(());
+        }
+
         while self.running.load(Ordering::SeqCst) {
             tokio::select! {
                 Some(_) = rx.recv() => {
                     let mut read_buf = [0u8; 2];
-                    if i2c.write_read(self.i2c_address, &[0x00], &mut read_buf).is_ok() {
+                    if i2c.read(self.i2c_address, &mut read_buf).is_ok() {
                         let raw_value = i16::from_be_bytes([read_buf[0], read_buf[1]]);
-                        let timestamp_nanos = start_time.elapsed().as_nanos();
                         
                         let reading = Reading {
                             value: raw_value,
-                            timestamp_nanos,
                         };
 
                         while !self.buffer.write(reading.clone()) {
