@@ -1,0 +1,15 @@
+[Unit]
+    Description=pymscada - Power Monitoring
+    BindsTo=pymscada-bus.service
+    After=pymscada-bus.service
+
+[Service]
+    WorkingDirectory=/home/jamie
+    ExecStart=/usr/local/bin/pymscada-rust --verbose
+    Restart=always
+    RestartSec=5
+    User=root
+    Group=root
+
+[Install]
+    WantedBy=multi-user.target

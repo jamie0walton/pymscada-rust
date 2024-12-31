@@ -50,6 +50,7 @@ pub enum TagMessage {
 pub struct TagManager {
     tags: Arc<RwLock<HashMap<String, Tag>>>,
     default_deadband: f64,
+    default_heartbeat: i64,  // microseconds
     sender: mpsc::Sender<TagMessage>,
 }
 
@@ -59,19 +60,50 @@ impl TagManager {
         (TagManager {
             tags: Arc::new(RwLock::new(HashMap::new())),
             default_deadband,
+            default_heartbeat: 10 * 60 * 1_000_000,  // 10 minutes in microseconds
             sender,
         }, receiver)
+    }
+
+    pub async fn set_deadband(&self, name: &str, deadband: f64) {
+        let mut tags = self.tags.write().await;
+        if let Some(tag) = tags.get_mut(name) {
+            tag.deadband = deadband;
+        } else {
+            // Create the tag with the specified deadband if it doesn't exist
+            tags.insert(
+                name.to_string(),
+                Tag {
+                    id: 0,
+                    name: name.to_string(),
+                    value: TagValue { value: 0.0, time_us: 0 },
+                    deadband,
+                },
+            );
+        }
     }
 
     pub async fn update(&self, name: &str, value: f64, time_us: i64) {
         let mut tags = self.tags.write().await;
         
         // Get existing tag's id and deadband or use defaults
-        let (id, deadband) = if let Some(existing_tag) = tags.get(name) {
+        let should_update = if let Some(existing_tag) = tags.get(name) {
             let diff = (existing_tag.value.value - value).abs();
-            if diff <= existing_tag.deadband {
-                return;
-            }
+            let time_since_update = time_us - existing_tag.value.time_us;
+            
+            // Update if either deadband is exceeded or heartbeat time has passed
+            diff > existing_tag.deadband || time_since_update >= self.default_heartbeat
+        } else {
+            // Always update for new tags
+            true
+        };
+
+        if !should_update {
+            return;
+        }
+
+        // Get existing tag's id and deadband or use defaults
+        let (id, deadband) = if let Some(existing_tag) = tags.get(name) {
             (existing_tag.id, existing_tag.deadband)
         } else {
             (0, self.default_deadband)
@@ -80,7 +112,7 @@ impl TagManager {
         tags.insert(
             name.to_string(),
             Tag {
-                id,  // Preserve existing ID
+                id,
                 name: name.to_string(),
                 value: TagValue { value, time_us },
                 deadband,

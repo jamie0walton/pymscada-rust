@@ -46,7 +46,7 @@ struct Args {
     #[arg(long, default_value_t = 1324)]
     bus_port: u16,
 
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, default_value_t = 0.1)]
     deadband: f64,
 
     #[arg(long, default_value_t = 60.0)]
@@ -72,9 +72,6 @@ struct Args {
     
     #[arg(long, default_value = "i2c_amps.log")]
     log_file: String,
-
-    #[arg(long)]
-    fft: bool,
 
     // On my raspberry pi 4, 737 readings takes 1 sec
     #[arg(long, default_value_t = 737)]
@@ -119,7 +116,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         app.args.batch_size,
         app.args.ct_ratio,
         app.args.verbose,
-        app.args.fft,
     );
     
     let mut bus_client = PyMScadaBusClient::new(
